@@ -5,8 +5,13 @@
 每个 profile 对应 llama-swap 里加载的一个模型, 一组模型相关配置:
   - display_name: 报告/结果里展示的名字
   - proc_match:   llama-server 进程 cmdline 中的 GGUF 文件名 (pgrep 定位进程用)
-  - model_id:     llama-swap 的 model id (API 请求 & 触发按需加载用)
+  - model_id:     model-proxy (5807, Anthropic /v1/messages) 的 model 名 (model-router.json 别名)
+  - openai_model: llama-swap (8080, OpenAI /v1/chat/completions) 的 model 名 (= config.yaml 的 key),
+                  evalplus_bench.py 走这条路径
   - log_file:     llama-server 的 --log-file 路径 (reasoning_effort 日志校验用)
+
+注意: model_id 与 openai_model 可能不同 —— 例如 UD 量化在 model-proxy 里叫
+"qwen3.8-27b-local", 但在 llama-swap 里叫 "qwen3.8-27b"。
 
 ACTIVE 支持一个或多个 profile:
   - 单个:  ACTIVE = "qwen3.8-27b-ud"
@@ -20,6 +25,7 @@ PROFILES = {
         "display_name": "qwen3.8-27b",
         "proc_match": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
         "model_id": "qwen3.8-27b-local",
+        "openai_model": "qwen3.8-27b",
         "log_file": "/home/loomz/.llama.cpp/logs/Qwen3.8-27B-UD-Q4_K_XL.log",
     },
     # NVFP4 MTP-HIGH 量化
@@ -27,6 +33,7 @@ PROFILES = {
         "display_name": "qwen3.8-27b",
         "proc_match": "Qwen3.8-27B-NVFP4-MTP-MID-HIGH.gguf",
         "model_id": "qwen3.8-27b-nvfp4",
+        "openai_model": "qwen3.8-27b-nvfp4",
         "log_file": "/home/loomz/.llama.cpp/logs/Qwen3.8-27B-NVFP4-MTP-MID-HIGH.log",
     },
 }
