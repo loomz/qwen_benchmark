@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
-Qwen3.6 & Qwen3.8 Code Ability & Efficiency Benchmark
-Tests qwen3.6-27b vs qwen3.8-27b vs qwen3.8-35b-a3b on code generation.
+Qwen Code Ability & Efficiency Benchmark + reasoning_effort 性能测试
 
-Your setup (same as Claude Code, from ~/.claude/settings.json):
-  - Server: llama-swap @ http://localhost:8080 (Anthropic-compatible API)
+调用路径 (与 Claude Code 相同, 见 model-proxy.py / llama-swap 配置):
+  5807 (model-proxy, Anthropic 兼容) -> 8080 (llama-swap) -> 5804 (llama-server)
   - Endpoint: POST /v1/messages  (headers: x-api-key, anthropic-version)
-  - Models: qwen3.6-27b, qwen3.8-27b, qwen3.6-35b (llama-swap model ids)
-  - All models have reasoning (thinking block streamed before text block)
+  - 模型: qwen3.8-27b (llama-swap model id: qwen3.8-27b-local)
+  - 所有模型有 reasoning (thinking block 在 text block 前流式返回)
 
-Usage:
+用法:
   pip install requests
-  python model_bench.py
+  python model_bench.py                 # 编码能力全量测试 (默认)
+  python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×3档×2次)
 
-Results -> results/benchmark_YYYYMMDD_HHMMSS.{md,json}
+结果按天存放 -> results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.{md,json}
+              或 results/YYYY-MM-DD/effort_YYYYMMDD_HHMMSS.{md,json}
+报告顶部原样记录当前 llama-server 中 qwen3.8 的配置 (进程 cmdline + /props)。
 """
 
+import os
+import re
 import time
 import json
+import argparse
 import textwrap
 import statistics
 import subprocess
@@ -49,6 +54,21 @@ GEN_KWARGS = {
 
 NUM_RUNS = 3
 OUTPUT_DIR = Path(__file__).parent / "results"
+
+# ---------------------------------------------------------------------------
+# qwen3.8 llama-server 配置发现 & reasoning_effort 测试
+# 调用路径: 5807 (model-proxy) -> 8080 (llama-swap) -> 5804 (llama-server)
+QWEN38_PROC_MATCH = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+QWEN38_LOG_FILE = "/home/loomz/.llama.cpp/logs/Qwen3.8-27B-UD-Q4_K_XL.log"
+
+# reasoning_effort 测试: 选 3 个有执行验证的任务, 3 档 effort, 各 2 次
+EFFORT_MODEL = ("qwen3.8-27b", "qwen3.8-27b-local")
+EFFORT_LEVELS = ["low", "medium", "xhigh"]
+EFFORT_TASK_NAMES = ["Fibonacci Memoization", "LRU Cache", "SQL Parser"]
+EFFORT_NUM_RUNS = 2
+# xhigh 档 thinking 实测可达 ~8000 token (SQL 任务单次推理 4000+ 词), 需足够余量给代码,
+# 否则代码被截断/未产出 (模型到 EOS 会停, 不会真生成到上限; 16384 覆盖 thinking+代码)
+EFFORT_MAX_TOKENS = 16384
 
 # ---------------------------------------------------------------------------
 TASKS = [
@@ -156,6 +176,11 @@ class Result:
     code_pass: bool = False
     code_detail: str = ""
     error: str = ""
+    # reasoning_effort 测试专用
+    effort: str = ""
+    rendered_effort: str = ""
+    effort_confirmed: bool = False
+    effort_detail: str = ""
 
 
 def extract_code(text: str) -> str:
@@ -189,7 +214,148 @@ def verify_code(code: str) -> tuple:
         return False, str(e)[:200]
 
 
-def call_model(model_id: str, prompt: str) -> dict:
+# ---------------------------------------------------------------------------
+# qwen3.8 llama-server 配置发现 (报告顶部原样记录当前配置)
+# ---------------------------------------------------------------------------
+def discover_qwen38() -> dict:
+    """定位运行中的 qwen3.8 llama-server 进程, 返回 {pid, cmdline, port}。
+    pgrep 可能返回多个 PID (含已退出的), 只取仍存活且 cmdline 含 llama-server 的。"""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", QWEN38_PROC_MATCH],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception as e:
+        return {"error": f"pgrep failed: {e}"}
+    for pid in [p for p in out.split() if p.strip()]:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue  # 进程已退出
+        cmdline = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        if "llama-server" not in cmdline:
+            continue
+        port = None
+        toks = cmdline.split()
+        for i, t in enumerate(toks):
+            if t == "--port" and i + 1 < len(toks):
+                port = toks[i + 1]
+                break
+        return {"pid": pid, "cmdline": cmdline, "port": port}
+    return {"error": f"no live llama-server matched {QWEN38_PROC_MATCH}"}
+
+
+def read_qwen38_config() -> dict:
+    """读取 qwen3.8 llama-server 当前配置: 进程 cmdline (原样) + /props (运行时)。"""
+    disc = discover_qwen38()
+    cfg = {
+        "cmdline": disc.get("cmdline", ""),
+        "port": disc.get("port"),
+        "pid": disc.get("pid"),
+        "props": None,
+        "error": disc.get("error", ""),
+    }
+    if cfg["port"]:
+        try:
+            r = requests.get(f"http://127.0.0.1:{cfg['port']}/props", timeout=10)
+            r.raise_for_status()
+            cfg["props"] = r.json()
+        except Exception as e:
+            cfg["error"] = f"cmdline OK, /props failed: {e}"
+    return cfg
+
+
+def config_header_md(cfg: dict) -> str:
+    """报告顶部: 原样记录当前 llama-server 中 qwen3.8 的配置。"""
+    L = []
+    L.append("## 0. 当前 llama-server 配置 (qwen3.8-27b, 原样记录)")
+    L.append("")
+    if cfg.get("error"):
+        L.append(f"> ⚠️ 配置读取: {cfg['error']}")
+        L.append("")
+    if cfg.get("cmdline"):
+        L.append(f"**进程** (PID {cfg.get('pid')}, port {cfg.get('port')}):")
+        L.append("")
+        L.append("```bash")
+        L.append(cfg["cmdline"])
+        L.append("```")
+        L.append("")
+    if cfg.get("props") is not None:
+        L.append("**/props (运行时状态, 原样):**")
+        L.append("")
+        L.append("```json")
+        L.append(json.dumps(cfg["props"], ensure_ascii=False, indent=2))
+        L.append("```")
+        L.append("")
+    return "\n".join(L)
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort 日志渲染校验 (best-effort, 异步 flush)
+# ---------------------------------------------------------------------------
+def verify_effort_batch(items, log_file: str = QWEN38_LOG_FILE,
+                        max_wait: int = 45, poll: int = 2) -> None:
+    """批量从 llama-server --log-file 校验每个请求实际渲染的 reasoning_effort。
+
+    items: [(marker, requested_effort, size_before, Result)]。
+    日志由单线程 worker 异步 flush (launch_slot 行含完整渲染 prompt), 最后一个
+    请求的行可能延迟 >20s, 故从最小 size_before 起增量读 (只读新字节, 保留跨行
+    残尾), 有界轮询。medium 档模板不注入指令, 渲染=none 为预期。
+    """
+    expected = {"low": "low", "xhigh": "xhigh", "medium": "none"}
+    pending = {m: (eff, tr) for (m, eff, _sb, tr) in items}
+    if not pending:
+        return
+    try:
+        offset = min(sb for (_m, _e, sb, _t) in items)
+    except ValueError:
+        offset = 0
+    tail = ""
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline and pending:
+        try:
+            size = os.path.getsize(log_file)
+        except OSError:
+            time.sleep(poll)
+            continue
+        if size > offset:
+            try:
+                with open(log_file, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(size - offset).decode("utf-8", "replace")
+                offset = size
+            except OSError:
+                time.sleep(poll)
+                continue
+            buf = tail + chunk
+            nl = buf.rfind("\n")
+            if nl == -1:  # 整段是未写完的超长行, 等下一轮
+                tail = buf
+                continue
+            tail = buf[nl + 1:]
+            for line in buf.splitlines():
+                if "launch_slot" not in line:
+                    continue
+                for m in list(pending):
+                    if m in line:
+                        m2 = re.search(r"Reasoning effort is set to (\w+)", line)
+                        rendered = m2.group(1) if m2 else "none"
+                        eff, tr = pending[m]
+                        tr.rendered_effort = rendered
+                        tr.effort_confirmed = (rendered == expected.get(eff))
+                        tr.effort_detail = f"log: rendered={rendered} (requested={eff})"
+                        del pending[m]
+        if pending:
+            time.sleep(poll)
+    for m, (eff, tr) in pending.items():
+        tr.rendered_effort = "not_flushed"
+        tr.effort_confirmed = False
+        tr.effort_detail = f"log: not flushed within {max_wait}s (requested={eff})"
+
+
+def call_model(model_id: str, prompt: str, effort: str = None,
+               marker: str = None, max_tokens: int = None) -> dict:
     # Anthropic Messages API (same protocol Claude Code speaks)
     payload = {
         "model": model_id,
@@ -198,6 +364,13 @@ def call_model(model_id: str, prompt: str) -> dict:
         "stream": True,
         **GEN_KWARGS,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if effort is not None:
+        payload["output_config"] = {"effort": effort}
+    if marker is not None:
+        # marker 只进 HTTP body (不进 bash 命令行), 故只出现在本请求的 launch_slot 日志行
+        payload["messages"][0]["content"] = f"[bench-marker: {marker}]\n\n{prompt}"
     headers = {
         "Content-Type": "application/json",
         "x-api-key": API_KEY,
@@ -291,7 +464,7 @@ def run_bench() -> List[Result]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("=" * 70)
-    print(f"  Qwen3.6 Code Benchmark  {now}")
+    print(f"  Qwen Code Benchmark  {now}")
     print(f"  Server: {API_URL}")
     print(f"  Models: {len(MODELS)}  |  Tasks: {len(TASKS)}  |  Runs: {NUM_RUNS}")
     print("=" * 70)
@@ -359,15 +532,98 @@ def run_bench() -> List[Result]:
     return results
 
 
-def gen_report(results: List[Result]) -> str:
+def run_effort_bench() -> tuple:
+    """reasoning_effort 性能测试: 3 任务 × 3 档 effort × 2 次。
+
+    每个请求带唯一 marker (嵌入 HTTP body, 不进 bash 命令行), 结束后批量从日志
+    校验渲染出的 effort 指令; 同时用行为信号 (推理 token/耗时) 作为主确认。
+    """
+    dn, mid = EFFORT_MODEL
+    tasks = [t for t in TASKS if t["name"] in EFFORT_TASK_NAMES]
+    cfg = read_qwen38_config()  # 记录测试开始时的配置
+    results: List[Result] = []
+    log_items = []  # (marker, requested_effort, size_before, Result)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print("=" * 70)
+    print(f"  Qwen3.8 reasoning_effort Benchmark  {now}")
+    print(f"  Server: {API_URL}  ->  llama-server :{cfg.get('port')}")
+    print(f"  Model: {dn}  |  Tasks: {[t['name'] for t in tasks]}")
+    print(f"  Effort levels: {EFFORT_LEVELS}  |  Runs: {EFFORT_NUM_RUNS}")
+    print("=" * 70)
+
+    for task in tasks:
+        for effort in EFFORT_LEVELS:
+            for idx in range(EFFORT_NUM_RUNS):
+                marker = (f"EB_{task['name'].replace(' ', '_')}"
+                          f"_{effort}_{int(time.time() * 1000)}")
+                try:
+                    size_before = os.path.getsize(QWEN38_LOG_FILE)
+                except OSError:
+                    size_before = 0
+                print(f"  {task['name']:<24} {effort:<7} #{idx + 1} ... ",
+                      end="", flush=True)
+                try:
+                    info = call_model(mid, task["prompt"], effort=effort,
+                                      marker=marker, max_tokens=EFFORT_MAX_TOKENS)
+                    tr = Result(
+                        task=task["name"], diff=task["diff"], model=dn, run=idx,
+                        verify=task["verify"],
+                        content_text=info["content_text"][:3000],
+                        reasoning_text=info["reasoning_text"][:1000],
+                        ttft_reasoning_s=info["ttft_reasoning_s"],
+                        ttft_content_s=info["ttft_content_s"],
+                        total_s=info["total_s"],
+                        reasoning_tokens=info["reasoning_tokens"],
+                        content_tokens=info["content_tokens"],
+                        total_tokens=info["total_tokens"],
+                        prompt_tps=info["prompt_tps"],
+                        predict_tps=info["predict_tps"],
+                        effort=effort,
+                    )
+                    if task["verify"]:
+                        if (info["content_text"] or "").strip():
+                            code = extract_code(info["content_text"])
+                            passed, detail = verify_code(code)
+                            tr.code_pass = passed
+                            tr.code_detail = detail
+                        else:
+                            # xhigh 推理耗尽 token 预算, 未产出代码 (不拿 thinking 当代码执行)
+                            tr.code_pass = False
+                            tr.code_detail = "no code: thinking exhausted budget"
+                    results.append(tr)
+                    log_items.append((marker, effort, size_before, tr))
+                    think_s = max(0.0, info["ttft_content_s"] - info["ttft_reasoning_s"])
+                    tag = "PASS" if tr.code_pass else ("FAIL" if task["verify"] else "SKIP")
+                    print(
+                        f"think={info['reasoning_tokens']}w/{think_s:.1f}s  "
+                        f"total={info['total_s']:.2f}s  "
+                        f"{info['predict_tps']:.1f}tok/s  [{tag}]"
+                    )
+                except Exception as e:
+                    print(f"ERROR: {e}")
+                    results.append(Result(
+                        task=task["name"], diff=task["diff"], model=dn, run=idx,
+                        verify=task["verify"], effort=effort, error=str(e),
+                    ))
+
+    print(f"\n  校验日志中的 reasoning_effort 渲染 (等待异步 flush, 最多 45s)...",
+          flush=True)
+    verify_effort_batch(log_items)
+    return results, cfg
+
+
+def gen_report(results: List[Result], cfg: dict) -> str:
+    models_label = ", ".join(dn for dn, _ in MODELS)
     L = []
-    L.append("# Qwen3.6 编码能力 & 效率基准测试")
+    L.append(f"# Qwen 编码能力 & 效率基准测试 ({models_label})")
     L.append("")
     L.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     L.append(f"硬件: RTX 5090D 24G")
-    L.append(f"服务端: llama-swap @ localhost:8080 (Anthropic API, 与 Claude Code 相同)")
+    L.append(f"服务端: model-proxy @ {API_URL} -> llama-swap :8080 -> llama-server :{cfg.get('port')}")
     L.append(f"每任务运行: {NUM_RUNS} 次")
     L.append("")
+    L.append(config_header_md(cfg))
     L.append("> \\* 速度为客户端估算: 生成速度=输出Tok/首Tok后耗时, Prompt速度=输入Tok/首Tok延迟; 总Tok 来自 API usage (精确)。")
     L.append("")
 
@@ -494,16 +750,183 @@ def gen_report(results: List[Result]) -> str:
     return "\n".join(L)
 
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    results = run_bench()
+def gen_effort_report(results: List[Result], cfg: dict) -> str:
+    L = []
+    L.append("# Qwen3.8 reasoning_effort 性能基准测试")
+    L.append("")
+    L.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    L.append(f"服务端: {API_URL} -> llama-swap :8080 -> llama-server :{cfg.get('port')}")
+    L.append(f"模型: {EFFORT_MODEL[0]}  |  任务: {', '.join(EFFORT_TASK_NAMES)}  |  每档运行 {EFFORT_NUM_RUNS} 次")
+    L.append("")
+    L.append("> 指标: 推理Tok=thinking 词数, 推理耗时≈TTFT代码-TTFT推理, 总Tok 来自 API usage (精确)。")
+    L.append("> 切换确认: 主信号=行为 (各档推理量差异); 辅证=日志渲染出的 effort 指令 (best-effort, 异步 flush)。")
+    L.append("")
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    txt = gen_report(results)
-    md = OUTPUT_DIR / f"benchmark_{ts}.md"
+    # Part 3: 配置原样记录
+    L.append(config_header_md(cfg))
+
+    # §1 明细表
+    L.append("## 1. 明细")
+    L.append("")
+    L.append("| 任务 | effort | # | 推理Tok | 推理耗时(s) | 总耗时(s) | 总Tok | 生成Tok/s | 切换确认 | 渲染effort | 通过 |")
+    L.append("|------|--------|---|---------|-------------|-----------|-------|-----------|----------|------------|------|")
+    for r in results:
+        if r.error:
+            L.append(f"| {r.task} | {r.effort} | {r.run + 1} | - | - | - | - | - | ERROR | - | - |")
+            continue
+        think_s = max(0.0, r.ttft_content_s - r.ttft_reasoning_s)
+        conf = "✅" if r.effort_confirmed else ("⚠️" if r.rendered_effort else "—")
+        ps = "Y" if r.code_pass else ("N" if r.verify else "-")
+        L.append(
+            f"| {r.task} | {r.effort} | {r.run + 1}"
+            f" | {r.reasoning_tokens}"
+            f" | {think_s:.2f}"
+            f" | {r.total_s:.2f}"
+            f" | {r.total_tokens}"
+            f" | {r.predict_tps:.1f}"
+            f" | {conf}"
+            f" | {r.rendered_effort or '-'}"
+            f" | {ps} |"
+        )
+    L.append("")
+
+    # §2 任务×effort 均值
+    L.append("## 2. 任务 × effort 均值")
+    L.append("")
+    L.append("| 任务 | effort | 推理Tok | 推理耗时(s) | 总耗时(s) | 生成Tok/s | 通过率 |")
+    L.append("|------|--------|---------|-------------|-----------|-----------|--------|")
+    for task in EFFORT_TASK_NAMES:
+        for effort in EFFORT_LEVELS:
+            mr = [r for r in results if r.task == task and r.effort == effort and not r.error]
+            if not mr:
+                continue
+            think_s = [max(0.0, r.ttft_content_s - r.ttft_reasoning_s) for r in mr]
+            passed = sum(1 for r in mr if r.code_pass)
+            L.append(
+                f"| {task} | {effort}"
+                f" | {statistics.mean(r.reasoning_tokens for r in mr):.0f}"
+                f" | {statistics.mean(think_s):.2f}"
+                f" | {statistics.mean(r.total_s for r in mr):.2f}"
+                f" | {statistics.mean(r.predict_tps for r in mr):.1f}"
+                f" | {passed}/{len(mr)} |"
+            )
+    L.append("")
+
+    # §3 切换确认
+    L.append("## 3. reasoning_effort 切换确认")
+    L.append("")
+    L.append("### 3a. 行为信号 (主确认)")
+    L.append("")
+    L.append("各 effort 档的平均推理量 (thinking 词数 / 推理耗时)。若 xhigh 显著高于 low, 说明 effort 指令确实改变了模型推理深度。")
+    L.append("")
+    L.append("| effort | 平均推理Tok | 平均推理耗时(s) | 平均总耗时(s) |")
+    L.append("|--------|-------------|-----------------|---------------|")
+    for effort in EFFORT_LEVELS:
+        mr = [r for r in results if r.effort == effort and not r.error]
+        if not mr:
+            continue
+        think_s = [max(0.0, r.ttft_content_s - r.ttft_reasoning_s) for r in mr]
+        L.append(
+            f"| {effort}"
+            f" | {statistics.mean(r.reasoning_tokens for r in mr):.0f}"
+            f" | {statistics.mean(think_s):.2f}"
+            f" | {statistics.mean(r.total_s for r in mr):.2f} |"
+        )
+    L.append("")
+
+    L.append("### 3b. 日志渲染确认 (辅证, best-effort)")
+    L.append("")
+    L.append("从 llama-server `--log-file` 的 `launch_slot` 行提取每个请求实际渲染的 effort 指令。")
+    L.append("medium 档模板不注入指令 (渲染=none 为预期)。日志异步缓冲 flush, 个别请求可能未 flush 到。")
+    L.append("")
+    L.append("| 任务 | effort | 请求 | 渲染effort | 匹配 | 说明 |")
+    L.append("|------|--------|------|------------|------|------|")
+    for r in results:
+        if r.error or not r.effort:
+            continue
+        match = "✅" if r.effort_confirmed else "❌"
+        L.append(f"| {r.task} | {r.effort} | #{r.run + 1} | {r.rendered_effort or '-'} | {match} | {r.effort_detail} |")
+    L.append("")
+
+    # 结论
+    def _avg(effort: str, attr: str) -> float:
+        mr = [r for r in results if r.effort == effort and not r.error]
+        return statistics.mean(getattr(r, attr) for r in mr) if mr else 0.0
+    low_r = _avg("low", "reasoning_tokens")
+    xhigh_r = _avg("xhigh", "reasoning_tokens")
+    n_log = sum(1 for r in results if r.effort and r.effort_confirmed)
+    n_tot = sum(1 for r in results if r.effort and not r.error)
+    L.append("### 3c. 结论")
+    L.append("")
+    if low_r and xhigh_r and xhigh_r > low_r:
+        L.append(f"- **行为确认**: xhigh 平均推理 {xhigh_r:.0f} 词 > low 平均 {low_r:.0f} 词, "
+                 f"effort 切换**生效**。")
+    else:
+        L.append(f"- **行为**: xhigh 推理 {xhigh_r:.0f} 词 vs low {low_r:.0f} 词 "
+                 f"(未观察到显著差异, 需人工复核)。")
+    L.append(f"- **日志确认**: {n_log}/{n_tot} 个请求的渲染 effort 与请求值一致。")
+    L.append("")
+
+    # §4 代码样例: 每任务挑一个有代码的 xhigh run; 若该任务 xhigh 全部未产出代码, 说明原因
+    L.append("## 4. 代码输出样例 (每任务 xhigh)")
+    L.append("")
+    xhigh_by_task = {}
+    for r in results:
+        if r.error or r.effort != "xhigh":
+            continue
+        xhigh_by_task.setdefault(r.task, []).append(r)
+    for task in [t["name"] for t in TASKS if t["name"] in EFFORT_TASK_NAMES]:
+        runs = xhigh_by_task.get(task)
+        if not runs:
+            continue
+        pick = next((r for r in runs if (r.content_text or "").strip()), None)
+        L.append(f"### {task} (xhigh)")
+        if pick is not None:
+            if pick.code_pass:
+                L.append("**执行: PASS**")
+            elif pick.code_detail:
+                L.append(f"**执行: {pick.code_detail}**")
+            L.append("")
+            L.append("```python")
+            L.append(pick.content_text[:2000])
+            L.append("```")
+        else:
+            tw = max(r.reasoning_tokens for r in runs)
+            L.append(
+                f"> ⚠️ xhigh 各次运行均在推理阶段耗尽 {EFFORT_MAX_TOKENS} token 预算, "
+                f"未产出代码 (单次推理达 {tw} 词)。"
+            )
+        L.append("")
+
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Qwen benchmark")
+    ap.add_argument("--mode", choices=["ability", "effort"], default="ability",
+                    help="ability=编码能力全量测试; effort=reasoning_effort 性能测试")
+    args = ap.parse_args()
+
+    # 结果按天存放: results/YYYY-MM-DD/<prefix>_<ts>.{md,json}
+    now = datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    out_dir = OUTPUT_DIR / now.strftime("%Y-%m-%d")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.mode == "effort":
+        results, cfg = run_effort_bench()
+        txt = gen_effort_report(results, cfg)
+        prefix = "effort"
+    else:
+        cfg = read_qwen38_config()
+        results = run_bench()
+        txt = gen_report(results, cfg)
+        prefix = "benchmark"
+
+    md = out_dir / f"{prefix}_{ts}.md"
     md.write_text(txt, encoding="utf-8")
 
-    jp = OUTPUT_DIR / f"benchmark_{ts}.json"
+    jp = out_dir / f"{prefix}_{ts}.json"
     jd = []
     for r in results:
         jd.append({
@@ -524,6 +947,10 @@ def main():
             "error": r.error,
             "content_preview": r.content_text[:500],
             "reasoning_preview": r.reasoning_text[:500],
+            "effort": r.effort,
+            "rendered_effort": r.rendered_effort,
+            "effort_confirmed": r.effort_confirmed,
+            "effort_detail": r.effort_detail,
         })
     jp.write_text(
         json.dumps(jd, ensure_ascii=False, indent=2, default=str),

@@ -55,10 +55,11 @@ python model_bench.py
 
 ## 输出
 
-结果写入 `results/` 目录，每次运行生成一对文件：
+结果**按天存放**在 `results/YYYY-MM-DD/` 目录，每次运行生成一对文件：
 
-- `results/benchmark_YYYYMMDD_HHMMSS.md` — 人类可读报告（分模型明细表、均值、跨模型对比总结、代码输出样例）
-- `results/benchmark_YYYYMMDD_HHMMSS.json` — 结构化原始数据（含代码/推理预览，便于二次分析）
+- `results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.md` — 人类可读报告（配置原样记录、分模型明细表、均值、跨模型对比总结、代码输出样例）
+- `results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.json` — 结构化原始数据（含代码/推理预览，便于二次分析）
+- `results/YYYY-MM-DD/effort_YYYYMMDD_HHMMSS.{md,json}` — reasoning_effort 性能测试（`--mode effort`）
 
 ## 指标说明
 
