@@ -29,7 +29,9 @@ python3 -m venv .venv
 
 ```bash
 source .venv/bin/activate
-python model_bench.py
+python model_bench.py                 # 编码能力全量测试 (默认 effort=xhigh)
+python model_bench.py --effort medium # 指定 ability 模式的 reasoning_effort
+python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×3档×2次)
 ```
 
 默认配置（可在 `model_bench.py` 顶部修改）：
@@ -39,9 +41,13 @@ python model_bench.py
 | `API_URL` | `http://localhost:5807/v1/messages` | llama-swap 端点 |
 | `MODELS` | `qwen3.8-27b` | 待测模型列表（展示名, llama-swap model id） |
 | `NUM_RUNS` | `3` | 每任务每模型运行次数 |
-| `GEN_KWARGS` | `temp=0.3, top_p=0.9, max_tokens=4096` | 生成参数 |
+| `GEN_KWARGS` | `temp=0.3, top_p=0.9, max_tokens=4096` | 生成参数（`max_tokens` 会被 `--max-tokens` 覆盖，实际默认 16384） |
+| `--effort` | `xhigh` | ability 模式 `reasoning_effort`（可选 low/medium/high/xhigh） |
+| `--max-tokens` | `16384` | ability 模式 `max_tokens`（xhigh thinking 可达数千 token，需留足余量给代码） |
 
-> 注意：llama-swap 切换模型时可能返回 502，脚本会自动等待 60s 后重试一次。
+> 注意：
+> - llama-swap 切换模型时可能返回 502，脚本会自动等待 60s 后重试一次。
+> - llama-swap 有 TTL，空闲后 llama-server 被卸载；读配置时若进程不存在，脚本会先发一个最小请求触发按需加载，再读取配置。
 
 ## 测试任务
 
@@ -57,7 +63,7 @@ python model_bench.py
 
 结果**按天存放**在 `results/YYYY-MM-DD/` 目录，每次运行生成一对文件：
 
-- `results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.md` — 人类可读报告（配置原样记录、分模型明细表、均值、跨模型对比总结、代码输出样例）
+- `results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.md` — 人类可读报告（配置原样记录、reasoning_effort/max_tokens、分模型明细表、均值、跨模型对比总结、代码输出样例）
 - `results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.json` — 结构化原始数据（含代码/推理预览，便于二次分析）
 - `results/YYYY-MM-DD/effort_YYYYMMDD_HHMMSS.{md,json}` — reasoning_effort 性能测试（`--mode effort`）
 

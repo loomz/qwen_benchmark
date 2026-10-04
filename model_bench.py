@@ -10,7 +10,8 @@ Qwen Code Ability & Efficiency Benchmark + reasoning_effort 性能测试
 
 用法:
   pip install requests
-  python model_bench.py                 # 编码能力全量测试 (默认)
+  python model_bench.py                 # 编码能力全量测试 (默认, effort=xhigh)
+  python model_bench.py --effort medium # 指定 ability 模式的 reasoning_effort
   python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×3档×2次)
 
 结果按天存放 -> results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.{md,json}
@@ -55,14 +56,20 @@ GEN_KWARGS = {
 NUM_RUNS = 3
 OUTPUT_DIR = Path(__file__).parent / "results"
 
+# 能力 benchmark 默认 reasoning_effort 与 token 上限 (可用 --effort / --max-tokens 覆盖)
+# xhigh 档 thinking 可达数千 token, 上限需留足余量给代码, 否则硬任务代码被截断
+BENCH_EFFORT = "xhigh"
+BENCH_MAX_TOKENS = 16384
+
 # ---------------------------------------------------------------------------
 # qwen3.8 llama-server 配置发现 & reasoning_effort 测试
 # 调用路径: 5807 (model-proxy) -> 8080 (llama-swap) -> 5804 (llama-server)
 QWEN38_PROC_MATCH = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+QWEN38_MODEL_ID = "qwen3.8-27b-local"  # llama-swap model id (触发按需加载用)
 QWEN38_LOG_FILE = "/home/loomz/.llama.cpp/logs/Qwen3.8-27B-UD-Q4_K_XL.log"
 
 # reasoning_effort 测试: 选 3 个有执行验证的任务, 3 档 effort, 各 2 次
-EFFORT_MODEL = ("qwen3.8-27b", "qwen3.8-27b-local")
+EFFORT_MODEL = ("qwen3.8-27b", QWEN38_MODEL_ID)
 EFFORT_LEVELS = ["low", "medium", "xhigh"]
 EFFORT_TASK_NAMES = ["Fibonacci Memoization", "LRU Cache", "SQL Parser"]
 EFFORT_NUM_RUNS = 2
@@ -246,9 +253,34 @@ def discover_qwen38() -> dict:
     return {"error": f"no live llama-server matched {QWEN38_PROC_MATCH}"}
 
 
+def _warm_up(model_id: str = QWEN38_MODEL_ID, timeout: int = 600) -> bool:
+    """llama-swap 有 TTL, 空闲后 llama-server 被卸载 -> 进程不存在。
+    发一个最小请求触发按需加载 (model_id 用 qwen3.8 的 id, 即 discover_qwen38 匹配的那个),
+    并轮询等待 llama-server 进程出现。"""
+    print(f"  llama-server 未加载 (llama-swap TTL 已卸载), 触发按需加载 (model={model_id}) ...",
+          flush=True)
+    try:
+        call_model(model_id, "ping", effort="low", max_tokens=1)
+    except Exception as e:
+        print(f"  warm-up 请求失败: {e}")
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if "pid" in discover_qwen38():
+            print("  llama-server 已加载。", flush=True)
+            return True
+        time.sleep(2)
+    print("  warm-up 超时, llama-server 仍未出现。", flush=True)
+    return False
+
+
 def read_qwen38_config() -> dict:
-    """读取 qwen3.8 llama-server 当前配置: 进程 cmdline (原样) + /props (运行时)。"""
+    """读取 qwen3.8 llama-server 当前配置: 进程 cmdline (原样) + /props (运行时)。
+    llama-swap 有 TTL, 空闲后 llama-server 被卸载 -> 进程不存在; 此时先按需唤醒再读。"""
     disc = discover_qwen38()
+    if "pid" not in disc:
+        _warm_up()
+        disc = discover_qwen38()
     cfg = {
         "cmdline": disc.get("cmdline", ""),
         "port": disc.get("port"),
@@ -266,6 +298,25 @@ def read_qwen38_config() -> dict:
     return cfg
 
 
+def _cmdline_multiline(cmdline: str) -> str:
+    """cmdline 拆多行: 可执行文件独占一行, 每个 -/-- 参数各占一行 (取值跟同一行)。"""
+    toks = cmdline.split()
+    if not toks:
+        return cmdline
+    lines = [toks[0]]
+    cur = None
+    for t in toks[1:]:
+        if t.startswith("-"):
+            if cur is not None:
+                lines.append("  " + cur)
+            cur = t
+        else:
+            cur = f"{cur} {t}" if cur else t
+    if cur is not None:
+        lines.append("  " + cur)
+    return "\n".join(lines)
+
+
 def config_header_md(cfg: dict) -> str:
     """报告顶部: 原样记录当前 llama-server 中 qwen3.8 的配置。"""
     L = []
@@ -278,7 +329,7 @@ def config_header_md(cfg: dict) -> str:
         L.append(f"**进程** (PID {cfg.get('pid')}, port {cfg.get('port')}):")
         L.append("")
         L.append("```bash")
-        L.append(cfg["cmdline"])
+        L.append(_cmdline_multiline(cfg["cmdline"]))
         L.append("```")
         L.append("")
     if cfg.get("props") is not None:
@@ -459,7 +510,8 @@ def call_model(model_id: str, prompt: str, effort: str = None,
     }
 
 
-def run_bench() -> List[Result]:
+def run_bench(effort: str = BENCH_EFFORT,
+              max_tokens: int = BENCH_MAX_TOKENS) -> List[Result]:
     results: List[Result] = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -467,6 +519,7 @@ def run_bench() -> List[Result]:
     print(f"  Qwen Code Benchmark  {now}")
     print(f"  Server: {API_URL}")
     print(f"  Models: {len(MODELS)}  |  Tasks: {len(TASKS)}  |  Runs: {NUM_RUNS}")
+    print(f"  reasoning_effort: {effort}  |  max_tokens: {max_tokens}")
     print("=" * 70)
 
     for task in TASKS:
@@ -479,7 +532,8 @@ def run_bench() -> List[Result]:
                 print(f"  {dn} #{idx + 1} ...", end=" ", flush=True)
 
                 try:
-                    info = call_model(mid, task["prompt"])
+                    info = call_model(mid, task["prompt"], effort=effort,
+                                      max_tokens=max_tokens)
 
                     tr = Result(
                         task=task["name"],
@@ -487,6 +541,7 @@ def run_bench() -> List[Result]:
                         model=dn,
                         run=idx,
                         verify=task["verify"],
+                        effort=effort,
                         content_text=info["content_text"][:3000],
                         reasoning_text=info["reasoning_text"][:1000],
                         ttft_reasoning_s=info["ttft_reasoning_s"],
@@ -613,7 +668,9 @@ def run_effort_bench() -> tuple:
     return results, cfg
 
 
-def gen_report(results: List[Result], cfg: dict) -> str:
+def gen_report(results: List[Result], cfg: dict,
+               effort: str = BENCH_EFFORT,
+               max_tokens: int = BENCH_MAX_TOKENS) -> str:
     models_label = ", ".join(dn for dn, _ in MODELS)
     L = []
     L.append(f"# Qwen 编码能力 & 效率基准测试 ({models_label})")
@@ -622,6 +679,7 @@ def gen_report(results: List[Result], cfg: dict) -> str:
     L.append(f"硬件: RTX 5090D 24G")
     L.append(f"服务端: model-proxy @ {API_URL} -> llama-swap :8080 -> llama-server :{cfg.get('port')}")
     L.append(f"每任务运行: {NUM_RUNS} 次")
+    L.append(f"reasoning_effort: {effort}  |  max_tokens: {max_tokens}")
     L.append("")
     L.append(config_header_md(cfg))
     L.append("> \\* 速度为客户端估算: 生成速度=输出Tok/首Tok后耗时, Prompt速度=输入Tok/首Tok延迟; 总Tok 来自 API usage (精确)。")
@@ -905,6 +963,11 @@ def main():
     ap = argparse.ArgumentParser(description="Qwen benchmark")
     ap.add_argument("--mode", choices=["ability", "effort"], default="ability",
                     help="ability=编码能力全量测试; effort=reasoning_effort 性能测试")
+    ap.add_argument("--effort", default=BENCH_EFFORT,
+                    help=f"ability 模式的 reasoning_effort (默认 {BENCH_EFFORT}; "
+                         f"可选 low/medium/high/xhigh)")
+    ap.add_argument("--max-tokens", type=int, default=BENCH_MAX_TOKENS,
+                    help=f"ability 模式的 max_tokens (默认 {BENCH_MAX_TOKENS})")
     args = ap.parse_args()
 
     # 结果按天存放: results/YYYY-MM-DD/<prefix>_<ts>.{md,json}
@@ -919,8 +982,9 @@ def main():
         prefix = "effort"
     else:
         cfg = read_qwen38_config()
-        results = run_bench()
-        txt = gen_report(results, cfg)
+        results = run_bench(effort=args.effort, max_tokens=args.max_tokens)
+        txt = gen_report(results, cfg, effort=args.effort,
+                         max_tokens=args.max_tokens)
         prefix = "benchmark"
 
     md = out_dir / f"{prefix}_{ts}.md"
