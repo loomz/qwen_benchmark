@@ -34,12 +34,12 @@ python model_bench.py --effort medium # 指定 ability 模式的 reasoning_effor
 python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×3档×2次)
 ```
 
-默认配置（可在 `model_bench.py` 顶部修改）：
+默认配置（生成参数在 `model_bench.py` 顶部，模型在 `bench_config.py`）：
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `API_URL` | `http://localhost:5807/v1/messages` | llama-swap 端点 |
-| `MODELS` | `qwen3.8-27b` | 待测模型列表（展示名, llama-swap model id） |
+| 模型 | `qwen3.8-27b` | 由 `bench_config.py` 的 `ACTIVE` profile 决定（见下） |
 | `NUM_RUNS` | `3` | 每任务每模型运行次数 |
 | `GEN_KWARGS` | `temp=0.3, top_p=0.9, max_tokens=4096` | 生成参数（`max_tokens` 会被 `--max-tokens` 覆盖，实际默认 16384） |
 | `--effort` | `xhigh` | ability 模式 `reasoning_effort`（可选 low/medium/high/xhigh） |
@@ -48,6 +48,30 @@ python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×
 > 注意：
 > - llama-swap 切换模型时可能返回 502，脚本会自动等待 60s 后重试一次。
 > - llama-swap 有 TTL，空闲后 llama-server 被卸载；读配置时若进程不存在，脚本会先发一个最小请求触发按需加载，再读取配置。
+
+## 切换模型
+
+模型相关配置集中在 `bench_config.py`，每个 profile 对应 llama-swap 里加载的一个模型：
+
+```python
+PROFILES = {
+    "qwen3.8-27b-ud": {
+        "display_name": "qwen3.8-27b",
+        "proc_match": "Qwen3.8-27B-UD-Q4_K_XL.gguf",   # pgrep 定位 llama-server 进程
+        "model_id":   "qwen3.8-27b-local",             # llama-swap model id
+        "log_file":   "/home/loomz/.llama.cpp/logs/Qwen3.8-27B-UD-Q4_K_XL.log",
+    },
+    "qwen3.8-27b-nvfp4": { ... },   # NVFP4-MTP-HIGH 量化
+}
+
+ACTIVE = ["qwen3.8-27b-ud"]        # 切换模型 = 改这里 (支持列表)
+PAUSE_SECONDS = 60                 # 多个 profile 之间停顿的秒数
+```
+
+- **切换模型**：把 `ACTIVE` 改成 `PROFILES` 里的 key（单个字符串或列表），`model_bench.py` 会自动用该 profile 的 `model_id` / `proc_match` / `log_file`。
+- **多个 profile**：`ACTIVE = ["qwen3.8-27b-ud", "qwen3.8-27b-nvfp4"]` → 依次测试，每个测完后停顿 `PAUSE_SECONDS` 秒再测下一个，各自生成独立报告。
+- **新增模型**：往 `PROFILES` 加一项，再让 `ACTIVE` 指向它。
+- 报告顶部 §0 与文件名都会标注当前 `profile=...`，区分同一 `display_name` 下的不同量化。
 
 ## 测试任务
 
@@ -61,11 +85,11 @@ python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×
 
 ## 输出
 
-结果**按天存放**在 `results/YYYY-MM-DD/` 目录，每次运行生成一对文件：
+结果**按天存放**在 `results/YYYY-MM-DD/` 目录，每个 profile 每次运行生成一对文件（文件名含 profile 名，多个 profile 各自独立）：
 
-- `results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.md` — 人类可读报告（配置原样记录、reasoning_effort/max_tokens、分模型明细表、均值、跨模型对比总结、代码输出样例）
-- `results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.json` — 结构化原始数据（含代码/推理预览，便于二次分析）
-- `results/YYYY-MM-DD/effort_YYYYMMDD_HHMMSS.{md,json}` — reasoning_effort 性能测试（`--mode effort`）
+- `results/YYYY-MM-DD/benchmark_<profile>_YYYYMMDD_HHMMSS.md` — 人类可读报告（配置原样记录、reasoning_effort/max_tokens、分模型明细表、均值、对比总结、代码输出样例）
+- `results/YYYY-MM-DD/benchmark_<profile>_YYYYMMDD_HHMMSS.json` — 结构化原始数据（含 profile 字段、代码/推理预览，便于二次分析）
+- `results/YYYY-MM-DD/effort_<profile>_YYYYMMDD_HHMMSS.{md,json}` — reasoning_effort 性能测试（`--mode effort`）
 
 ## 指标说明
 

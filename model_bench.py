@@ -5,7 +5,7 @@ Qwen Code Ability & Efficiency Benchmark + reasoning_effort 性能测试
 调用路径 (与 Claude Code 相同, 见 model-proxy.py / llama-swap 配置):
   5807 (model-proxy, Anthropic 兼容) -> 8080 (llama-swap) -> 5804 (llama-server)
   - Endpoint: POST /v1/messages  (headers: x-api-key, anthropic-version)
-  - 模型: qwen3.8-27b (llama-swap model id: qwen3.8-27b-local)
+  - 模型: 见 bench_config.py (ACTIVE profile, 默认 qwen3.8-27b)
   - 所有模型有 reasoning (thinking block 在 text block 前流式返回)
 
 用法:
@@ -35,17 +35,16 @@ from typing import List
 
 import requests
 
+# 模型相关配置集中在 bench_config.py (切换模型改那里的 ACTIVE, 支持多个 profile)
+from bench_config import active_profiles, PAUSE_SECONDS
+
 # ---------------------------------------------------------------------------
 # Same endpoint & protocol as Claude Code (ANTHROPIC_BASE_URL in settings.json)
 API_URL = "http://localhost:5807/v1/messages"
 API_KEY = "local"
 ANTHROPIC_VERSION = "2023-06-01"
 
-MODELS = [
-    ("qwen3.8-27b",       "qwen3.8-27b-local"),
-    # ("qwen3.6-27b",       "qwen3.6-27b"),
-    # ("qwen3.6-35b",   "qwen3.6-35b"),
-]
+# 待测模型: 由 bench_config.ACTIVE profile 决定 (每个 profile 一个模型, 见 bench_config.py)
 
 GEN_KWARGS = {
     "temperature": 0.3,
@@ -64,12 +63,10 @@ BENCH_MAX_TOKENS = 16384
 # ---------------------------------------------------------------------------
 # qwen3.8 llama-server 配置发现 & reasoning_effort 测试
 # 调用路径: 5807 (model-proxy) -> 8080 (llama-swap) -> 5804 (llama-server)
-QWEN38_PROC_MATCH = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
-QWEN38_MODEL_ID = "qwen3.8-27b-local"  # llama-swap model id (触发按需加载用)
-QWEN38_LOG_FILE = "/home/loomz/.llama.cpp/logs/Qwen3.8-27B-UD-Q4_K_XL.log"
+# 模型相关 (proc_match / model_id / log_file / display_name) 由 bench_config.py 的
+# ACTIVE profile 提供, 运行时按 profile 传入各函数 (见 main)。
 
 # reasoning_effort 测试: 选 3 个有执行验证的任务, 3 档 effort, 各 2 次
-EFFORT_MODEL = ("qwen3.8-27b", QWEN38_MODEL_ID)
 EFFORT_LEVELS = ["low", "medium", "xhigh"]
 EFFORT_TASK_NAMES = ["Fibonacci Memoization", "LRU Cache", "SQL Parser"]
 EFFORT_NUM_RUNS = 2
@@ -224,12 +221,12 @@ def verify_code(code: str) -> tuple:
 # ---------------------------------------------------------------------------
 # qwen3.8 llama-server 配置发现 (报告顶部原样记录当前配置)
 # ---------------------------------------------------------------------------
-def discover_qwen38() -> dict:
-    """定位运行中的 qwen3.8 llama-server 进程, 返回 {pid, cmdline, port}。
+def discover_qwen38(proc_match: str) -> dict:
+    """定位运行中的 llama-server 进程, 返回 {pid, cmdline, port}。
     pgrep 可能返回多个 PID (含已退出的), 只取仍存活且 cmdline 含 llama-server 的。"""
     try:
         out = subprocess.run(
-            ["pgrep", "-f", QWEN38_PROC_MATCH],
+            ["pgrep", "-f", proc_match],
             capture_output=True, text=True, timeout=10,
         ).stdout
     except Exception as e:
@@ -250,12 +247,12 @@ def discover_qwen38() -> dict:
                 port = toks[i + 1]
                 break
         return {"pid": pid, "cmdline": cmdline, "port": port}
-    return {"error": f"no live llama-server matched {QWEN38_PROC_MATCH}"}
+    return {"error": f"no live llama-server matched {proc_match}"}
 
 
-def _warm_up(model_id: str = QWEN38_MODEL_ID, timeout: int = 600) -> bool:
+def _warm_up(model_id: str, proc_match: str, timeout: int = 600) -> bool:
     """llama-swap 有 TTL, 空闲后 llama-server 被卸载 -> 进程不存在。
-    发一个最小请求触发按需加载 (model_id 用 qwen3.8 的 id, 即 discover_qwen38 匹配的那个),
+    发一个最小请求触发按需加载 (model_id 即 discover_qwen38 匹配的那个),
     并轮询等待 llama-server 进程出现。"""
     print(f"  llama-server 未加载 (llama-swap TTL 已卸载), 触发按需加载 (model={model_id}) ...",
           flush=True)
@@ -266,7 +263,7 @@ def _warm_up(model_id: str = QWEN38_MODEL_ID, timeout: int = 600) -> bool:
         return False
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if "pid" in discover_qwen38():
+        if "pid" in discover_qwen38(proc_match):
             print("  llama-server 已加载。", flush=True)
             return True
         time.sleep(2)
@@ -274,13 +271,13 @@ def _warm_up(model_id: str = QWEN38_MODEL_ID, timeout: int = 600) -> bool:
     return False
 
 
-def read_qwen38_config() -> dict:
-    """读取 qwen3.8 llama-server 当前配置: 进程 cmdline (原样) + /props (运行时)。
+def read_qwen38_config(profile: dict) -> dict:
+    """读取 llama-server 当前配置: 进程 cmdline (原样) + /props (运行时)。
     llama-swap 有 TTL, 空闲后 llama-server 被卸载 -> 进程不存在; 此时先按需唤醒再读。"""
-    disc = discover_qwen38()
+    disc = discover_qwen38(profile["proc_match"])
     if "pid" not in disc:
-        _warm_up()
-        disc = discover_qwen38()
+        _warm_up(profile["model_id"], profile["proc_match"])
+        disc = discover_qwen38(profile["proc_match"])
     cfg = {
         "cmdline": disc.get("cmdline", ""),
         "port": disc.get("port"),
@@ -317,10 +314,10 @@ def _cmdline_multiline(cmdline: str) -> str:
     return "\n".join(lines)
 
 
-def config_header_md(cfg: dict) -> str:
-    """报告顶部: 原样记录当前 llama-server 中 qwen3.8 的配置。"""
+def config_header_md(cfg: dict, profile: dict) -> str:
+    """报告顶部: 原样记录当前 llama-server 中该 profile 的配置。"""
     L = []
-    L.append("## 0. 当前 llama-server 配置 (qwen3.8-27b, 原样记录)")
+    L.append(f"## 0. 当前 llama-server 配置 ({profile['display_name']}, profile={profile['name']}, 原样记录)")
     L.append("")
     if cfg.get("error"):
         L.append(f"> ⚠️ 配置读取: {cfg['error']}")
@@ -345,7 +342,7 @@ def config_header_md(cfg: dict) -> str:
 # ---------------------------------------------------------------------------
 # reasoning_effort 日志渲染校验 (best-effort, 异步 flush)
 # ---------------------------------------------------------------------------
-def verify_effort_batch(items, log_file: str = QWEN38_LOG_FILE,
+def verify_effort_batch(items, log_file: str,
                         max_wait: int = 45, poll: int = 2) -> None:
     """批量从 llama-server --log-file 校验每个请求实际渲染的 reasoning_effort。
 
@@ -510,15 +507,16 @@ def call_model(model_id: str, prompt: str, effort: str = None,
     }
 
 
-def run_bench(effort: str = BENCH_EFFORT,
+def run_bench(profile: dict, effort: str = BENCH_EFFORT,
               max_tokens: int = BENCH_MAX_TOKENS) -> List[Result]:
+    models = [(profile["display_name"], profile["model_id"])]
     results: List[Result] = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("=" * 70)
-    print(f"  Qwen Code Benchmark  {now}")
+    print(f"  Qwen Code Benchmark  {now}  (profile={profile['name']})")
     print(f"  Server: {API_URL}")
-    print(f"  Models: {len(MODELS)}  |  Tasks: {len(TASKS)}  |  Runs: {NUM_RUNS}")
+    print(f"  Models: {len(models)}  |  Tasks: {len(TASKS)}  |  Runs: {NUM_RUNS}")
     print(f"  reasoning_effort: {effort}  |  max_tokens: {max_tokens}")
     print("=" * 70)
 
@@ -527,7 +525,7 @@ def run_bench(effort: str = BENCH_EFFORT,
         print(f"  [{task['diff'].upper()}] {task['name']}")
         print(f"{'-' * 60}")
 
-        for dn, mid in MODELS:
+        for dn, mid in models:
             for idx in range(NUM_RUNS):
                 print(f"  {dn} #{idx + 1} ...", end=" ", flush=True)
 
@@ -587,21 +585,21 @@ def run_bench(effort: str = BENCH_EFFORT,
     return results
 
 
-def run_effort_bench() -> tuple:
+def run_effort_bench(profile: dict) -> tuple:
     """reasoning_effort 性能测试: 3 任务 × 3 档 effort × 2 次。
 
     每个请求带唯一 marker (嵌入 HTTP body, 不进 bash 命令行), 结束后批量从日志
     校验渲染出的 effort 指令; 同时用行为信号 (推理 token/耗时) 作为主确认。
     """
-    dn, mid = EFFORT_MODEL
+    dn, mid = profile["display_name"], profile["model_id"]
     tasks = [t for t in TASKS if t["name"] in EFFORT_TASK_NAMES]
-    cfg = read_qwen38_config()  # 记录测试开始时的配置
+    cfg = read_qwen38_config(profile)  # 记录测试开始时的配置
     results: List[Result] = []
     log_items = []  # (marker, requested_effort, size_before, Result)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print("=" * 70)
-    print(f"  Qwen3.8 reasoning_effort Benchmark  {now}")
+    print(f"  {profile['display_name']} reasoning_effort Benchmark  {now}  (profile={profile['name']})")
     print(f"  Server: {API_URL}  ->  llama-server :{cfg.get('port')}")
     print(f"  Model: {dn}  |  Tasks: {[t['name'] for t in tasks]}")
     print(f"  Effort levels: {EFFORT_LEVELS}  |  Runs: {EFFORT_NUM_RUNS}")
@@ -613,7 +611,7 @@ def run_effort_bench() -> tuple:
                 marker = (f"EB_{task['name'].replace(' ', '_')}"
                           f"_{effort}_{int(time.time() * 1000)}")
                 try:
-                    size_before = os.path.getsize(QWEN38_LOG_FILE)
+                    size_before = os.path.getsize(profile["log_file"])
                 except OSError:
                     size_before = 0
                 print(f"  {task['name']:<24} {effort:<7} #{idx + 1} ... ",
@@ -664,16 +662,17 @@ def run_effort_bench() -> tuple:
 
     print(f"\n  校验日志中的 reasoning_effort 渲染 (等待异步 flush, 最多 45s)...",
           flush=True)
-    verify_effort_batch(log_items)
+    verify_effort_batch(log_items, profile["log_file"])
     return results, cfg
 
 
-def gen_report(results: List[Result], cfg: dict,
+def gen_report(results: List[Result], cfg: dict, profile: dict,
                effort: str = BENCH_EFFORT,
                max_tokens: int = BENCH_MAX_TOKENS) -> str:
-    models_label = ", ".join(dn for dn, _ in MODELS)
+    models = [(profile["display_name"], profile["model_id"])]
+    models_label = ", ".join(dn for dn, _ in models)
     L = []
-    L.append(f"# Qwen 编码能力 & 效率基准测试 ({models_label})")
+    L.append(f"# Qwen 编码能力 & 效率基准测试 ({models_label}, profile={profile['name']})")
     L.append("")
     L.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     L.append(f"硬件: RTX 5090D 24G")
@@ -681,11 +680,12 @@ def gen_report(results: List[Result], cfg: dict,
     L.append(f"每任务运行: {NUM_RUNS} 次")
     L.append(f"reasoning_effort: {effort}  |  max_tokens: {max_tokens}")
     L.append("")
-    L.append(config_header_md(cfg))
+    L.append(config_header_md(cfg, profile))
     L.append("> \\* 速度为客户端估算: 生成速度=输出Tok/首Tok后耗时, Prompt速度=输入Tok/首Tok延迟; 总Tok 来自 API usage (精确)。")
+    L.append("> 推理词数/代码词数为按空格分词的估算值 (非精确token数); 通过率仅统计 verify=True 的任务。")
     L.append("")
 
-    for dn, mid in MODELS:
+    for dn, mid in models:
         mr = [r for r in results if r.model == dn and not r.error]
         if not mr:
             L.append(f"## {dn} -- 无数据")
@@ -696,7 +696,7 @@ def gen_report(results: List[Result], cfg: dict,
         L.append("")
         L.append(
             "| 任务 | # | TTFT推理(s) | TTFT代码(s) | 总耗时(s) "
-            "| 推理Tok | 代码Tok | 总Tok | 生成Tok/s* | 通过 |"
+            "| 推理词数(估) | 代码词数(估) | 总Tok | 生成Tok/s* | 通过 |"
         )
         L.append(
             "|------|---|-------------|-------------|----------"
@@ -725,18 +725,19 @@ def gen_report(results: List[Result], cfg: dict,
         c_toks = [r.content_tokens for r in mr]
         tpss = [r.predict_tps for r in mr]
         p_tps = [r.prompt_tps for r in mr]
-        passed = sum(1 for r in mr if r.code_pass)
+        verify_runs = [r for r in mr if r.verify]
+        passed = sum(1 for r in verify_runs if r.code_pass)
 
         L.append("")
         L.append(
             f"**均值**: TTFT推理={statistics.mean(ttft_rs):.2f}s, "
             f"TTFT代码={statistics.mean(ttft_cs):.2f}s, "
             f"总耗时={statistics.mean(totals):.2f}s, "
-            f"推理Tok={statistics.mean(r_toks):.0f}, "
-            f"代码Tok={statistics.mean(c_toks):.0f}, "
+            f"推理词数(估)={statistics.mean(r_toks):.0f}, "
+            f"代码词数(估)={statistics.mean(c_toks):.0f}, "
             f"服务端Tok/s={statistics.mean(tpss):.1f}, "
             f"PromptTok/s={statistics.mean(p_tps):.1f}, "
-            f"通过率={passed}/{len(mr)}"
+            f"通过率={passed}/{len(verify_runs)} (仅verify任务)"
         )
         L.append("")
 
@@ -744,7 +745,7 @@ def gen_report(results: List[Result], cfg: dict,
     L.append("## 对比总结")
     L.append("")
 
-    model_names = [dn for dn, _ in MODELS]
+    model_names = [dn for dn, _ in models]
     header = "| 指标 | " + " | ".join(model_names) + " |"
     sep = "|------|" + "|".join(["-------" for _ in model_names]) + "|"
     L.append(header)
@@ -756,12 +757,12 @@ def gen_report(results: List[Result], cfg: dict,
         ("total", "总耗时 (s)"),
         ("tps", "生成速度 (tok/s)*"),
         ("ptps", "Prompt 速度 (tok/s)*"),
-        ("r_tok", "推理 Token 数"),
-        ("c_tok", "代码 Token 数"),
-        ("pass", "代码通过率"),
+        ("r_tok", "推理词数(估)"),
+        ("c_tok", "代码词数(估)"),
+        ("pass", "代码通过率(仅verify)"),
     ]:
         vals = []
-        for dn2, mid2 in MODELS:
+        for dn2, mid2 in models:
             mr2 = [r for r in results if r.model == dn2 and not r.error]
             if not mr2:
                 vals.append("N/A")
@@ -781,8 +782,10 @@ def gen_report(results: List[Result], cfg: dict,
             elif key == "c_tok":
                 vals.append(f"{statistics.mean(r.content_tokens for r in mr2):.0f}")
             elif key == "pass":
-                p = sum(1 for r in mr2 if r.code_pass) / len(mr2)
-                vals.append(f"{p:.0%}")
+                verify_runs2 = [r for r in mr2 if r.verify]
+                pass_count = sum(1 for r in verify_runs2 if r.code_pass)
+                p = pass_count / len(verify_runs2) if verify_runs2 else 0
+                vals.append(f"{p:.0%} ({pass_count}/{len(verify_runs2)})")
         L.append(f"| {label} | " + " | ".join(vals) + " |")
 
     L.append("")
@@ -808,20 +811,20 @@ def gen_report(results: List[Result], cfg: dict,
     return "\n".join(L)
 
 
-def gen_effort_report(results: List[Result], cfg: dict) -> str:
+def gen_effort_report(results: List[Result], cfg: dict, profile: dict) -> str:
     L = []
-    L.append("# Qwen3.8 reasoning_effort 性能基准测试")
+    L.append(f"# {profile['display_name']} reasoning_effort 性能基准测试 (profile={profile['name']})")
     L.append("")
     L.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     L.append(f"服务端: {API_URL} -> llama-swap :8080 -> llama-server :{cfg.get('port')}")
-    L.append(f"模型: {EFFORT_MODEL[0]}  |  任务: {', '.join(EFFORT_TASK_NAMES)}  |  每档运行 {EFFORT_NUM_RUNS} 次")
+    L.append(f"模型: {profile['display_name']}  |  任务: {', '.join(EFFORT_TASK_NAMES)}  |  每档运行 {EFFORT_NUM_RUNS} 次")
     L.append("")
     L.append("> 指标: 推理Tok=thinking 词数, 推理耗时≈TTFT代码-TTFT推理, 总Tok 来自 API usage (精确)。")
     L.append("> 切换确认: 主信号=行为 (各档推理量差异); 辅证=日志渲染出的 effort 指令 (best-effort, 异步 flush)。")
     L.append("")
 
     # Part 3: 配置原样记录
-    L.append(config_header_md(cfg))
+    L.append(config_header_md(cfg, profile))
 
     # §1 明细表
     L.append("## 1. 明细")
@@ -970,61 +973,78 @@ def main():
                     help=f"ability 模式的 max_tokens (默认 {BENCH_MAX_TOKENS})")
     args = ap.parse_args()
 
-    # 结果按天存放: results/YYYY-MM-DD/<prefix>_<ts>.{md,json}
-    now = datetime.now()
-    ts = now.strftime("%Y%m%d_%H%M%S")
-    out_dir = OUTPUT_DIR / now.strftime("%Y-%m-%d")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    profiles = active_profiles()
+    print(f"  待测 profile: {[p['name'] for p in profiles]}  "
+          f"(共 {len(profiles)} 个, 间隔 {PAUSE_SECONDS}s)")
 
-    if args.mode == "effort":
-        results, cfg = run_effort_bench()
-        txt = gen_effort_report(results, cfg)
-        prefix = "effort"
-    else:
-        cfg = read_qwen38_config()
-        results = run_bench(effort=args.effort, max_tokens=args.max_tokens)
-        txt = gen_report(results, cfg, effort=args.effort,
-                         max_tokens=args.max_tokens)
-        prefix = "benchmark"
+    for i, profile in enumerate(profiles):
+        # 结果按天存放: results/YYYY-MM-DD/<prefix>_<profile>_<ts>.{md,json}
+        now = datetime.now()
+        ts = now.strftime("%Y%m%d_%H%M%S")
+        out_dir = OUTPUT_DIR / now.strftime("%Y-%m-%d")
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    md = out_dir / f"{prefix}_{ts}.md"
-    md.write_text(txt, encoding="utf-8")
+        print(f"\n{'#' * 70}")
+        print(f"# profile {i + 1}/{len(profiles)}: {profile['name']} "
+              f"({profile['display_name']})")
+        print(f"{'#' * 70}")
 
-    jp = out_dir / f"{prefix}_{ts}.json"
-    jd = []
-    for r in results:
-        jd.append({
-            "task": r.task,
-            "difficulty": r.diff,
-            "model": r.model,
-            "run": r.run,
-            "ttft_reasoning_s": r.ttft_reasoning_s,
-            "ttft_content_s": r.ttft_content_s,
-            "total_s": r.total_s,
-            "reasoning_tokens": r.reasoning_tokens,
-            "content_tokens": r.content_tokens,
-            "total_tokens": r.total_tokens,
-            "prompt_tps": r.prompt_tps,
-            "predict_tps": r.predict_tps,
-            "code_pass": r.code_pass,
-            "code_detail": r.code_detail,
-            "error": r.error,
-            "content_preview": r.content_text[:500],
-            "reasoning_preview": r.reasoning_text[:500],
-            "effort": r.effort,
-            "rendered_effort": r.rendered_effort,
-            "effort_confirmed": r.effort_confirmed,
-            "effort_detail": r.effort_detail,
-        })
-    jp.write_text(
-        json.dumps(jd, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+        if args.mode == "effort":
+            results, cfg = run_effort_bench(profile)
+            txt = gen_effort_report(results, cfg, profile)
+            prefix = "effort"
+        else:
+            cfg = read_qwen38_config(profile)
+            results = run_bench(profile, effort=args.effort,
+                                max_tokens=args.max_tokens)
+            txt = gen_report(results, cfg, profile, effort=args.effort,
+                             max_tokens=args.max_tokens)
+            prefix = "benchmark"
 
-    print(f"\n{'=' * 70}")
-    print(f"  Report: {md}")
-    print(f"  JSON:   {jp}")
-    print(f"{'=' * 70}")
+        md = out_dir / f"{prefix}_{profile['name']}_{ts}.md"
+        md.write_text(txt, encoding="utf-8")
+
+        jp = out_dir / f"{prefix}_{profile['name']}_{ts}.json"
+        jd = []
+        for r in results:
+            jd.append({
+                "task": r.task,
+                "difficulty": r.diff,
+                "model": r.model,
+                "run": r.run,
+                "profile": profile["name"],
+                "ttft_reasoning_s": r.ttft_reasoning_s,
+                "ttft_content_s": r.ttft_content_s,
+                "total_s": r.total_s,
+                "reasoning_tokens": r.reasoning_tokens,
+                "content_tokens": r.content_tokens,
+                "total_tokens": r.total_tokens,
+                "prompt_tps": r.prompt_tps,
+                "predict_tps": r.predict_tps,
+                "code_pass": r.code_pass,
+                "code_detail": r.code_detail,
+                "error": r.error,
+                "content_preview": r.content_text[:500],
+                "reasoning_preview": r.reasoning_text[:500],
+                "effort": r.effort,
+                "rendered_effort": r.rendered_effort,
+                "effort_confirmed": r.effort_confirmed,
+                "effort_detail": r.effort_detail,
+            })
+        jp.write_text(
+            json.dumps(jd, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+        print(f"\n{'=' * 70}")
+        print(f"  Report: {md}")
+        print(f"  JSON:   {jp}")
+        print(f"{'=' * 70}")
+
+        # 测完一个, 停顿 PAUSE_SECONDS 秒再测下一个 (最后一个不停)
+        if i < len(profiles) - 1:
+            print(f"\n  停顿 {PAUSE_SECONDS}s 后测试下一个 profile ...", flush=True)
+            time.sleep(PAUSE_SECONDS)
 
 
 if __name__ == "__main__":
