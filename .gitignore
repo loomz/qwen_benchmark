@@ -8,9 +8,6 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# 基准测试输出（如需将结果纳入版本管理，删除下一行）
-results/
-
 # 编辑器 / 系统
 .vscode/
 .idea/
