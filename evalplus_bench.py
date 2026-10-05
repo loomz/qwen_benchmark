@@ -39,7 +39,7 @@ from bench_config import active_profiles, PAUSE_SECONDS
 OPENAI_BASE_URL = "http://localhost:8080/v1"   # llama-swap 的 OpenAI 端点
 API_KEY = "none"                               # llama-swap 不校验 key
 DATASET = "humaneval"                          # HumanEval+ (164 题); 可选 mbpp
-MAX_TOKENS = 2048                              # 每题生成上限 (留足余量防截断)
+MAX_TOKENS = 8192                              # 每题生成上限 (留足余量防截断)
 TEMPERATURE = 0.0                              # greedy (对应 --greedy)
 REQUEST_TIMEOUT = 600                          # 单请求超时 (含可能的模型加载)
 WARMUP_TIMEOUT = 600                           # warmup 请求超时
