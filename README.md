@@ -106,11 +106,14 @@ PAUSE_SECONDS = 60                 # 多个 profile 之间停顿的秒数
 
 ## 输出
 
-结果**按天存放**在 `results/YYYY-MM-DD/` 目录，每个 profile 每次运行生成一对文件（文件名含 profile 名，多个 profile 各自独立）：
+结果**按天存放**在 `results/YYYY-MM-DD/` 目录，每个 profile 每次运行生成独立报告（文件名含 profile 名，多个 profile 各自独立）：
 
 - `results/YYYY-MM-DD/benchmark_<profile>_YYYYMMDD_HHMMSS.md` — 人类可读报告（配置原样记录、reasoning_effort/max_tokens、分模型明细表、均值、对比总结、代码输出样例）
 - `results/YYYY-MM-DD/benchmark_<profile>_YYYYMMDD_HHMMSS.json` — 结构化原始数据（含 profile 字段、代码/推理预览，便于二次分析）
 - `results/YYYY-MM-DD/effort_<profile>_YYYYMMDD_HHMMSS.{md,json}` — reasoning_effort 性能测试（`--mode effort`）
+- `results/YYYY-MM-DD/evalplus_<profile>_YYYYMMDD_HHMMSS/` — evalplus_bench.py 的工作目录：`solutions.jsonl`（生成解）、`codegen_timing.json`（逐题 timing）、`*_eval_results.json`（evalplus 打分）、`report.md` / `report.json`（汇总报告，含 pass@1 与逐题明细）
+
+两个脚本的报告顶部（§0）都会原样记录当前模型服务进程（llama-server；ninfer profile 为 ninfer-serve）的 cmdline 与 `/props` 运行时状态（由共享模块 `bench_utils.py` 读取，进程未加载时先触发按需加载）。
 
 ## 指标说明
 
