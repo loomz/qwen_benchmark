@@ -3,6 +3,8 @@
 能力: 用 evalplus 跑 HumanEval+ (164 题, 含增强测试用例), 得到 pass@1 (base / base+plus)。
 效率: 生成时直接从 llama-server 的 OpenAI 响应 (usage + timings) 捕获每题的
       生成时间 (decode 阶段) 与 token 数, 计算生成速度 tok/s。
+配置: 报告顶部原样记录当前模型服务 (llama-server; ninfer profile 为 ninfer-serve)
+      的进程配置 (cmdline + /props), 与 model_bench.py 共用 bench_utils。
 
 为什么自己驱动生成循环?
   evalplus 0.3.1 的输出 (solutions.jsonl / eval_results.json) 不含逐题时间戳,
@@ -33,7 +35,9 @@ from pathlib import Path
 
 import requests
 
-from bench_config import active_profiles, PAUSE_SECONDS
+from bench_config import active_profiles, get_profile, PAUSE_SECONDS
+# 模型服务 (llama-server; ninfer profile 为 ninfer-serve) 配置发现/记录, 与 model_bench 共享
+from bench_utils import read_qwen38_config, config_header_md
 
 # ---- 生成参数 (与 evalplus OpenAI 后端默认对齐, 可被 CLI 覆盖) ----
 OPENAI_BASE_URL = "http://localhost:8080/v1"   # llama-swap 的 OpenAI 端点
@@ -240,8 +244,9 @@ def _fmt_tps(v):
 
 
 def build_report(profile, records, eval_results, base_url, max_tokens, temperature,
-                 dataset, limit, warmup_s, skipped_eval) -> tuple:
-    """合并 pass/fail 与逐题 timing, 返回 (markdown, json_dict)。"""
+                 dataset, limit, warmup_s, skipped_eval, cfg=None) -> tuple:
+    """合并 pass/fail 与逐题 timing, 返回 (markdown, json_dict)。
+    cfg: bench_utils.read_qwen38_config 的结果, 原样记录进报告 (模型服务进程配置)。"""
     eval_map = {}
     if eval_results:
         for task_id, lst in eval_results.get("eval", {}).items():
@@ -333,6 +338,10 @@ def build_report(profile, records, eval_results, base_url, max_tokens, temperatu
     L.append(f"- **模型加载耗时 (warmup)**: {warmup_s:.1f}s")
     L.append(f"- **时间**: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
 
+    # 原样记录当前模型服务 (llama-server; ninfer profile 为 ninfer-serve) 的配置
+    if cfg:
+        L.append(config_header_md(cfg, profile))
+
     L.append("## 汇总\n")
     L.append("| 指标 | 值 |")
     L.append("|------|-----|")
@@ -374,7 +383,7 @@ def build_report(profile, records, eval_results, base_url, max_tokens, temperatu
              "缺失时用 输出tokens/墙钟时间 估算。")
     L.append("- **pass@1 (base)**: 仅基础测试用例通过; **pass@1 (base+plus)**: 基础+增强测试全部通过。")
     L.append("- 生成路径走 llama-swap (8080) OpenAI 端点, 用 profile 的 `openai_model` 触发按需加载/切换。")
-    return "\n".join(L), {"summary": summary, "rows": rows}
+    return "\n".join(L), {"summary": summary, "rows": rows, "server_config": cfg or {}}
 
 
 def main():
@@ -385,6 +394,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=TEMPERATURE)
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 题 (0=全量)")
     ap.add_argument("--skip-eval", action="store_true", help="只生成不评测 (跳过 pass@1)")
+    ap.add_argument("--profile",
+                    help="只测这个 profile (bench_config.PROFILES 的 key); 默认按 ACTIVE 全量列表")
     args = ap.parse_args()
 
     # evalplus.evaluate 要求样本覆盖数据集全部题目, 故 --limit (部分题) 无法打分 -> 自动跳过评测
@@ -392,7 +403,7 @@ def main():
     if args.limit and not args.skip_eval:
         print(f"  注意: --limit {args.limit} 只生成部分题, evalplus 无法对部分集打分, 自动跳过评测 (pass@1)。")
 
-    profiles = active_profiles()
+    profiles = [get_profile(args.profile)] if args.profile else active_profiles()
     print(f"  待测 profile: {[p['name'] for p in profiles]}  (共 {len(profiles)} 个, 间隔 {PAUSE_SECONDS}s)")
     print(f"  base_url={args.base_url}  dataset={args.dataset}  max_tokens={args.max_tokens}  "
           f"temp={args.temperature}  limit={args.limit or '全量'}  skip_eval={skip_eval}")
@@ -412,6 +423,17 @@ def main():
             continue
         print(f"  模型就绪 (warmup {warmup_s:.1f}s)", flush=True)
 
+        # 获取并打印当前模型服务 (llama-server; ninfer profile 为 ninfer-serve) 的进程配置,
+        # 原样记录进报告 (与 model_bench.py 一致)
+        cfg = read_qwen38_config(profile)
+        print(f"  模型服务进程: PID={cfg.get('pid')} port={cfg.get('port')}", flush=True)
+        if cfg.get("cmdline"):
+            print(f"  cmdline: {cfg['cmdline']}", flush=True)
+        if cfg.get("props") is not None:
+            print(f"  /props: {json.dumps(cfg['props'], ensure_ascii=False)[:300]}", flush=True)
+        if cfg.get("error"):
+            print(f"  ⚠️ 配置读取: {cfg['error']}", flush=True)
+
         records, sol_path = run_codegen(
             profile, args.base_url, args.max_tokens, args.temperature,
             args.dataset, args.limit, work_dir,
@@ -428,7 +450,7 @@ def main():
         md, js = build_report(
             profile, records, eval_results, args.base_url, args.max_tokens,
             args.temperature, args.dataset, args.limit, warmup_s,
-            skip_eval or eval_results is None,
+            skip_eval or eval_results is None, cfg=cfg,
         )
         (work_dir / "report.md").write_text(md, encoding="utf-8")
         (work_dir / "report.json").write_text(json.dumps(js, ensure_ascii=False, indent=2),

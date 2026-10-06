@@ -2,21 +2,21 @@
 """
 Qwen Code Ability & Efficiency Benchmark + reasoning_effort 性能测试
 
-调用路径 (与 Claude Code 相同, 见 model-proxy.py / llama-swap 配置):
-  5807 (model-proxy, Anthropic 兼容) -> 8080 (llama-swap) -> 5804 (llama-server)
-  - Endpoint: POST /v1/messages  (headers: x-api-key, anthropic-version)
-  - 模型: 见 bench_config.py (ACTIVE profile, 默认 qwen3.8-27b)
-  - 所有模型有 reasoning (thinking block 在 text block 前流式返回)
+调用路径 (统一走 llama-swap, 见 llama-swap config.yaml):
+  8080 (llama-swap, OpenAI 兼容) -> llama-server (动态端口)
+  - Endpoint: POST /v1/chat/completions  (headers: Authorization: Bearer none)
+  - 模型: 见 bench_config.py (ACTIVE profile, openai_model 即 llama-swap key)
+  - thinking 模型流式先返回 reasoning_content (思考), 再返回 content (代码)
 
 用法:
   pip install requests
-  python model_bench.py                 # 编码能力全量测试 (默认, effort=xhigh)
-  python model_bench.py --effort medium # 指定 ability 模式的 reasoning_effort
+  python model_bench.py                 # 编码能力全量测试 (默认 effort=medium, --effort 覆盖)
+  python model_bench.py --effort xhigh # 指定 ability 模式的 reasoning_effort
   python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×3档×2次)
 
 结果按天存放 -> results/YYYY-MM-DD/benchmark_YYYYMMDD_HHMMSS.{md,json}
               或 results/YYYY-MM-DD/effort_YYYYMMDD_HHMMSS.{md,json}
-报告顶部原样记录当前 llama-server 中 qwen3.8 的配置 (进程 cmdline + /props)。
+报告顶部原样记录当前 llama-server 中该 profile 的配置 (进程 cmdline + /props)。
 """
 
 import os
@@ -36,13 +36,14 @@ from typing import List
 import requests
 
 # 模型相关配置集中在 bench_config.py (切换模型改那里的 ACTIVE, 支持多个 profile)
-from bench_config import active_profiles, PAUSE_SECONDS
+from bench_config import active_profiles, get_profile, PAUSE_SECONDS
+# 模型服务 (llama-server; ninfer profile 为 ninfer-serve) 配置发现/记录, 与 evalplus_bench 共享
+from bench_utils import read_qwen38_config, config_header_md
 
 # ---------------------------------------------------------------------------
-# Same endpoint & protocol as Claude Code (ANTHROPIC_BASE_URL in settings.json)
-API_URL = "http://localhost:5807/v1/messages"
-API_KEY = "local"
-ANTHROPIC_VERSION = "2023-06-01"
+# 统一走 llama-swap (8080, OpenAI 兼容 /v1/chat/completions); model-proxy 5807 已停用
+API_URL = "http://localhost:8080/v1/chat/completions"
+API_KEY = "none"
 
 # 待测模型: 由 bench_config.ACTIVE profile 决定 (每个 profile 一个模型, 见 bench_config.py)
 
@@ -56,14 +57,15 @@ NUM_RUNS = 3
 OUTPUT_DIR = Path(__file__).parent / "results"
 
 # 能力 benchmark 默认 reasoning_effort 与 token 上限 (可用 --effort / --max-tokens 覆盖)
-# xhigh 档 thinking 可达数千 token, 上限需留足余量给代码, 否则硬任务代码被截断
-BENCH_EFFORT = "xhigh"
+# 默认 medium; 需更高推理深度时显式 --effort xhigh (xhigh thinking 可达数千 token,
+# max_tokens 需留足余量给代码, 否则硬任务代码被截断)
+BENCH_EFFORT = "medium"
 BENCH_MAX_TOKENS = 16384
 
 # ---------------------------------------------------------------------------
 # qwen3.8 llama-server 配置发现 & reasoning_effort 测试
-# 调用路径: 5807 (model-proxy) -> 8080 (llama-swap) -> 5804 (llama-server)
-# 模型相关 (proc_match / model_id / log_file / display_name) 由 bench_config.py 的
+# 调用路径: 8080 (llama-swap) -> llama-server (动态端口)
+# 模型相关 (proc_match / openai_model / log_file / display_name) 由 bench_config.py 的
 # ACTIVE profile 提供, 运行时按 profile 传入各函数 (见 main)。
 
 # reasoning_effort 测试: 选 3 个有执行验证的任务, 3 档 effort, 各 2 次
@@ -218,125 +220,10 @@ def verify_code(code: str) -> tuple:
         return False, str(e)[:200]
 
 
-# ---------------------------------------------------------------------------
-# qwen3.8 llama-server 配置发现 (报告顶部原样记录当前配置)
-# ---------------------------------------------------------------------------
-def discover_qwen38(proc_match: str) -> dict:
-    """定位运行中的 llama-server 进程, 返回 {pid, cmdline, port}。
-    pgrep 可能返回多个 PID (含已退出的), 只取仍存活且 cmdline 含 llama-server 的。"""
-    try:
-        out = subprocess.run(
-            ["pgrep", "-f", proc_match],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
-    except Exception as e:
-        return {"error": f"pgrep failed: {e}"}
-    for pid in [p for p in out.split() if p.strip()]:
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                raw = f.read()
-        except OSError:
-            continue  # 进程已退出
-        cmdline = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
-        if "llama-server" not in cmdline:
-            continue
-        port = None
-        toks = cmdline.split()
-        for i, t in enumerate(toks):
-            if t == "--port" and i + 1 < len(toks):
-                port = toks[i + 1]
-                break
-        return {"pid": pid, "cmdline": cmdline, "port": port}
-    return {"error": f"no live llama-server matched {proc_match}"}
+# 模型服务 (llama-server; ninfer profile 为 ninfer-serve) 配置发现/唤醒/记录
+# 在 bench_utils.read_qwen38_config (与 evalplus_bench.py 共享)
 
 
-def _warm_up(model_id: str, proc_match: str, timeout: int = 600) -> bool:
-    """llama-swap 有 TTL, 空闲后 llama-server 被卸载 -> 进程不存在。
-    发一个最小请求触发按需加载 (model_id 即 discover_qwen38 匹配的那个),
-    并轮询等待 llama-server 进程出现。"""
-    print(f"  llama-server 未加载 (llama-swap TTL 已卸载), 触发按需加载 (model={model_id}) ...",
-          flush=True)
-    try:
-        call_model(model_id, "ping", effort="low", max_tokens=1)
-    except Exception as e:
-        print(f"  warm-up 请求失败: {e}")
-        return False
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if "pid" in discover_qwen38(proc_match):
-            print("  llama-server 已加载。", flush=True)
-            return True
-        time.sleep(2)
-    print("  warm-up 超时, llama-server 仍未出现。", flush=True)
-    return False
-
-
-def read_qwen38_config(profile: dict) -> dict:
-    """读取 llama-server 当前配置: 进程 cmdline (原样) + /props (运行时)。
-    llama-swap 有 TTL, 空闲后 llama-server 被卸载 -> 进程不存在; 此时先按需唤醒再读。"""
-    disc = discover_qwen38(profile["proc_match"])
-    if "pid" not in disc:
-        _warm_up(profile["model_id"], profile["proc_match"])
-        disc = discover_qwen38(profile["proc_match"])
-    cfg = {
-        "cmdline": disc.get("cmdline", ""),
-        "port": disc.get("port"),
-        "pid": disc.get("pid"),
-        "props": None,
-        "error": disc.get("error", ""),
-    }
-    if cfg["port"]:
-        try:
-            r = requests.get(f"http://127.0.0.1:{cfg['port']}/props", timeout=10)
-            r.raise_for_status()
-            cfg["props"] = r.json()
-        except Exception as e:
-            cfg["error"] = f"cmdline OK, /props failed: {e}"
-    return cfg
-
-
-def _cmdline_multiline(cmdline: str) -> str:
-    """cmdline 拆多行: 可执行文件独占一行, 每个 -/-- 参数各占一行 (取值跟同一行)。"""
-    toks = cmdline.split()
-    if not toks:
-        return cmdline
-    lines = [toks[0]]
-    cur = None
-    for t in toks[1:]:
-        if t.startswith("-"):
-            if cur is not None:
-                lines.append("  " + cur)
-            cur = t
-        else:
-            cur = f"{cur} {t}" if cur else t
-    if cur is not None:
-        lines.append("  " + cur)
-    return "\n".join(lines)
-
-
-def config_header_md(cfg: dict, profile: dict) -> str:
-    """报告顶部: 原样记录当前 llama-server 中该 profile 的配置。"""
-    L = []
-    L.append(f"## 0. 当前 llama-server 配置 ({profile['display_name']}, profile={profile['name']}, 原样记录)")
-    L.append("")
-    if cfg.get("error"):
-        L.append(f"> ⚠️ 配置读取: {cfg['error']}")
-        L.append("")
-    if cfg.get("cmdline"):
-        L.append(f"**进程** (PID {cfg.get('pid')}, port {cfg.get('port')}):")
-        L.append("")
-        L.append("```bash")
-        L.append(_cmdline_multiline(cfg["cmdline"]))
-        L.append("```")
-        L.append("")
-    if cfg.get("props") is not None:
-        L.append("**/props (运行时状态, 原样):**")
-        L.append("")
-        L.append("```json")
-        L.append(json.dumps(cfg["props"], ensure_ascii=False, indent=2))
-        L.append("```")
-        L.append("")
-    return "\n".join(L)
 
 
 # ---------------------------------------------------------------------------
@@ -404,25 +291,29 @@ def verify_effort_batch(items, log_file: str,
 
 def call_model(model_id: str, prompt: str, effort: str = None,
                marker: str = None, max_tokens: int = None) -> dict:
-    # Anthropic Messages API (same protocol Claude Code speaks)
+    # OpenAI Chat Completions (llama-swap 8080, 统一路径; model-proxy 已停用)
+    user_content = prompt
+    if marker is not None:
+        # marker 只进 HTTP body (不进 bash 命令行), 故只出现在本请求的 launch_slot 日志行
+        user_content = f"[bench-marker: {marker}]\n\n{prompt}"
     payload = {
         "model": model_id,
-        "system": SYSTEM,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
         "stream": True,
+        "stream_options": {"include_usage": True},
         **GEN_KWARGS,
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     if effort is not None:
-        payload["output_config"] = {"effort": effort}
-    if marker is not None:
-        # marker 只进 HTTP body (不进 bash 命令行), 故只出现在本请求的 launch_slot 日志行
-        payload["messages"][0]["content"] = f"[bench-marker: {marker}]\n\n{prompt}"
+        # llama-server 原生支持请求级 effort (output_config/reasoning/reasoning_effort 三种格式)
+        payload["reasoning_effort"] = effort
     headers = {
         "Content-Type": "application/json",
-        "x-api-key": API_KEY,
-        "anthropic-version": ANTHROPIC_VERSION,
+        "Authorization": f"Bearer {API_KEY}",
     }
 
     # llama-swap may 502 while swapping models; retry once after a pause
@@ -462,36 +353,42 @@ def call_model(model_id: str, prompt: str, effort: str = None,
         except json.JSONDecodeError:
             continue
 
-        etype = data.get("type", "")
-        if etype == "message_start":
-            input_tokens = (data.get("message", {})
-                            .get("usage", {}).get("input_tokens", 0))
-        elif etype == "content_block_delta":
-            delta = data.get("delta", {})
-            dtype = delta.get("type", "")
-            if dtype == "thinking_delta":
-                if first_reasoning_ts is None:
-                    first_reasoning_ts = time.monotonic()
-                full_reasoning += delta.get("thinking", "")
-            elif dtype == "text_delta":
-                if first_content_ts is None:
-                    first_content_ts = time.monotonic()
-                full_content += delta.get("text", "")
-        elif etype == "message_delta":
-            output_tokens = data.get("usage", {}).get("output_tokens", 0)
-        elif etype == "message_stop":
-            break
+        # OpenAI 流式: chunk 可带 usage (stream_options.include_usage) 与 choices[0].delta
+        usage = data.get("usage")
+        if usage:
+            input_tokens = usage.get("prompt_tokens", input_tokens)
+            output_tokens = usage.get("completion_tokens", output_tokens)
+
+        choices = data.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        # thinking 模型: 先 reasoning_content (思考), 后 content (代码); 无思考时前者缺失
+        rc = delta.get("reasoning_content")
+        if rc:
+            if first_reasoning_ts is None:
+                first_reasoning_ts = time.monotonic()
+            full_reasoning += rc
+        c = delta.get("content")
+        if c:
+            if first_content_ts is None:
+                first_content_ts = time.monotonic()
+            full_content += c
 
     total_s = time.monotonic() - t_start
     ttft_r = (first_reasoning_ts - t_start) if first_reasoning_ts else 0
     ttft_c = (first_content_ts - t_start) if first_content_ts else total_s
 
-    # Anthropic API exposes no server timings; estimate from the stream:
-    #   predict_tps = output tokens / (first-token -> end)
-    #   prompt_tps  = input tokens  / (start -> first token)  (upper bound)
+    # OpenAI API 不直接给服务端计时; 从流估算:
+    #   predict_tps = 输出 token / (首 token -> 结束)
+    #   prompt_tps  = 输入 token / (开始 -> 首 token)  (上界)
     gen_span = total_s - ttft_r
     predict_tps = output_tokens / gen_span if gen_span > 0 else 0.0
     prompt_tps = input_tokens / ttft_r if ttft_r > 0 else 0.0
+
+    # total_tokens 优先取 usage.completion_tokens (精确); 缺失时回退按词估算
+    if not output_tokens:
+        output_tokens = len(full_reasoning.split()) + len(full_content.split())
 
     return {
         "content_text": full_content,
@@ -509,7 +406,7 @@ def call_model(model_id: str, prompt: str, effort: str = None,
 
 def run_bench(profile: dict, effort: str = BENCH_EFFORT,
               max_tokens: int = BENCH_MAX_TOKENS) -> List[Result]:
-    models = [(profile["display_name"], profile["model_id"])]
+    models = [(profile["display_name"], profile["openai_model"])]
     results: List[Result] = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -591,7 +488,7 @@ def run_effort_bench(profile: dict) -> tuple:
     每个请求带唯一 marker (嵌入 HTTP body, 不进 bash 命令行), 结束后批量从日志
     校验渲染出的 effort 指令; 同时用行为信号 (推理 token/耗时) 作为主确认。
     """
-    dn, mid = profile["display_name"], profile["model_id"]
+    dn, mid = profile["display_name"], profile["openai_model"]
     tasks = [t for t in TASKS if t["name"] in EFFORT_TASK_NAMES]
     cfg = read_qwen38_config(profile)  # 记录测试开始时的配置
     results: List[Result] = []
@@ -669,14 +566,14 @@ def run_effort_bench(profile: dict) -> tuple:
 def gen_report(results: List[Result], cfg: dict, profile: dict,
                effort: str = BENCH_EFFORT,
                max_tokens: int = BENCH_MAX_TOKENS) -> str:
-    models = [(profile["display_name"], profile["model_id"])]
+    models = [(profile["display_name"], profile["openai_model"])]
     models_label = ", ".join(dn for dn, _ in models)
     L = []
     L.append(f"# Qwen 编码能力 & 效率基准测试 ({models_label}, profile={profile['name']})")
     L.append("")
     L.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     L.append(f"硬件: RTX 5090D 24G")
-    L.append(f"服务端: model-proxy @ {API_URL} -> llama-swap :8080 -> llama-server :{cfg.get('port')}")
+    L.append(f"服务端: llama-swap @ {API_URL} -> llama-server :{cfg.get('port')}")
     L.append(f"每任务运行: {NUM_RUNS} 次")
     L.append(f"reasoning_effort: {effort}  |  max_tokens: {max_tokens}")
     L.append("")
@@ -816,7 +713,7 @@ def gen_effort_report(results: List[Result], cfg: dict, profile: dict) -> str:
     L.append(f"# {profile['display_name']} reasoning_effort 性能基准测试 (profile={profile['name']})")
     L.append("")
     L.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    L.append(f"服务端: {API_URL} -> llama-swap :8080 -> llama-server :{cfg.get('port')}")
+    L.append(f"服务端: llama-swap @ {API_URL} -> llama-server :{cfg.get('port')}")
     L.append(f"模型: {profile['display_name']}  |  任务: {', '.join(EFFORT_TASK_NAMES)}  |  每档运行 {EFFORT_NUM_RUNS} 次")
     L.append("")
     L.append("> 指标: 推理Tok=thinking 词数, 推理耗时≈TTFT代码-TTFT推理, 总Tok 来自 API usage (精确)。")
@@ -971,9 +868,11 @@ def main():
                          f"可选 low/medium/high/xhigh)")
     ap.add_argument("--max-tokens", type=int, default=BENCH_MAX_TOKENS,
                     help=f"ability 模式的 max_tokens (默认 {BENCH_MAX_TOKENS})")
+    ap.add_argument("--profile",
+                    help="只测这个 profile (bench_config.PROFILES 的 key); 默认按 ACTIVE 全量列表")
     args = ap.parse_args()
 
-    profiles = active_profiles()
+    profiles = [get_profile(args.profile)] if args.profile else active_profiles()
     print(f"  待测 profile: {[p['name'] for p in profiles]}  "
           f"(共 {len(profiles)} 个, 间隔 {PAUSE_SECONDS}s)")
 

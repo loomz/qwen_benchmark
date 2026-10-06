@@ -1,17 +1,20 @@
 # Qwen 编码能力 & 效率基准测试
 
-针对本地 llama-swap 服务（Anthropic 兼容 API）上的 Qwen 模型，进行代码生成能力与推理效率的自动化基准测试。
+针对本地 llama-swap 服务（OpenAI 兼容 API, 8080 端口）上的 Qwen 模型，进行代码生成能力与推理效率的自动化基准测试。
 
-对比指标包括：
+测试集（均按 `bench_config.py` 的 ACTIVE profile 依次测试，各自独立报告）：
 
-- **能力**：生成代码能否通过实际执行验证（`python -c` 运行，含超时保护）
-- **效率**：TTFT（推理首字 / 代码首字延迟）、总耗时、生成速度 (tok/s)、Prompt 处理速度 (tok/s)、推理/代码 Token 数
+- `model_bench.py` — 编码能力全量测试 + reasoning_effort 性能测试
+  - **能力**：生成代码能否通过实际执行验证（`python -c` 运行，含超时保护）
+  - **效率**：TTFT（推理首字 / 代码首字延迟）、总耗时、生成速度 (tok/s)、Prompt 处理速度 (tok/s)、推理/代码 Token 数
+- `evalplus_bench.py` — EvalPlus HumanEval+（164 题）pass@1 + 逐题生成速度
+- `run_all_bench.py` — 按 profile 串行编排以上测试集（一个模型加载一次，跑完全部测试集再切下一个）
 
 ## 环境要求
 
 - Python 3.12+
-- 本地 llama-swap 服务运行中（Anthropic 兼容，`POST /v1/messages`）
-- 依赖：`requests`
+- 本地 llama-swap 服务运行中（OpenAI 兼容，`POST /v1/chat/completions`，端口 8080）
+- 依赖：`requests`；跑 `evalplus_bench.py` 还需 `evalplus`
 
 ## 安装
 
@@ -29,20 +32,36 @@ python3 -m venv .venv
 
 ```bash
 source .venv/bin/activate
-python model_bench.py                 # 编码能力全量测试 (默认 effort=xhigh)
-python model_bench.py --effort medium # 指定 ability 模式的 reasoning_effort
+
+# model_bench: 编码能力全量测试
+python model_bench.py                 # 默认 effort=medium, 按 ACTIVE 全量 profile
+python model_bench.py --effort xhigh # 指定 ability 模式的 reasoning_effort
 python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×3档×2次)
+python model_bench.py --profile qwen3.8-27b-ninfer   # 只测单个 profile (不传则按 ACTIVE 全量)
+
+# evalplus: HumanEval+ pass@1
+python evalplus_bench.py                  # 全量 164 题 (base+plus)
+python evalplus_bench.py --limit 5        # 只跑前 5 题 (快速验证; 自动跳过评测)
+python evalplus_bench.py --skip-eval      # 只生成不评测 (无 pass@1, 更快)
+python evalplus_bench.py --profile qwen3.8-27b-nvfp4   # 只测单个 profile
+
+# run_all_bench: 按 profile 串行 (每个 profile 加载一次模型, 跑完全部启用的测试集再切下一个)
+python run_all_bench.py                 # 每个 profile: model_bench -> evalplus
+python run_all_bench.py --tests model_bench        # 只跑 model_bench (ACTIVE_TESTS 可在脚本内改)
+python run_all_bench.py --mb-args "--effort xhigh --max-tokens 16384" \
+                        --ep-args "--limit 5 --skip-eval"   # 给各测试集透传参数
+python run_all_bench.py --continue-on-error         # 某步失败跳过该 profile 剩余测试集, 继续下一个
 ```
 
 默认配置（生成参数在 `model_bench.py` 顶部，模型在 `bench_config.py`）：
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `API_URL` | `http://localhost:5807/v1/messages` | llama-swap 端点 |
+| `API_URL` | `http://localhost:8080/v1/chat/completions` | llama-swap 端点 (OpenAI 兼容; model-proxy 5807 已停用) |
 | 模型 | `qwen3.8-27b` | 由 `bench_config.py` 的 `ACTIVE` profile 决定（见下） |
 | `NUM_RUNS` | `3` | 每任务每模型运行次数 |
 | `GEN_KWARGS` | `temp=0.3, top_p=0.9, max_tokens=4096` | 生成参数（`max_tokens` 会被 `--max-tokens` 覆盖，实际默认 16384） |
-| `--effort` | `xhigh` | ability 模式 `reasoning_effort`（可选 low/medium/high/xhigh） |
+| `--effort` | `medium` | ability 模式 `reasoning_effort`（可选 low/medium/high/xhigh） |
 | `--max-tokens` | `16384` | ability 模式 `max_tokens`（xhigh thinking 可达数千 token，需留足余量给代码） |
 
 > 注意：
@@ -56,20 +75,22 @@ python model_bench.py --mode effort   # reasoning_effort 性能测试 (3任务×
 ```python
 PROFILES = {
     "qwen3.8-27b-ud": {
-        "display_name": "qwen3.8-27b",
-        "proc_match": "Qwen3.8-27B-UD-Q4_K_XL.gguf",   # pgrep 定位 llama-server 进程
-        "model_id":   "qwen3.8-27b-local",             # llama-swap model id
+        "display_name": "qwen3.8-27b-ud",
+        "proc_match": "Qwen3.8-27B-UD-Q4_K_XL.gguf",   # pgrep 定位模型服务进程 (llama-server; ninfer profile 为 ninfer-serve)
+        "model_id":   "qwen3.8-27b-ud",                 # 已废弃 (原 model-proxy 5807 别名), 仅为兼容保留
+        "openai_model": "qwen3.8-27b-ud",               # llama-swap (8080) 的 model 名, 触发按需加载/切换
         "log_file":   "/home/loomz/.llama.cpp/logs/Qwen3.8-27B-UD-Q4_K_XL.log",
     },
-    "qwen3.8-27b-nvfp4": { ... },   # NVFP4-MTP-HIGH 量化
+    "qwen3.8-27b-nvfp4":  { ... },   # NVFP4-MTP-HIGH 量化
+    "qwen3.8-27b-ninfer": { ... },   # ninfer 后端 (proc_match="ninfer-serve")
 }
 
 ACTIVE = ["qwen3.8-27b-ud"]        # 切换模型 = 改这里 (支持列表)
 PAUSE_SECONDS = 60                 # 多个 profile 之间停顿的秒数
 ```
 
-- **切换模型**：把 `ACTIVE` 改成 `PROFILES` 里的 key（单个字符串或列表），`model_bench.py` 会自动用该 profile 的 `model_id` / `proc_match` / `log_file`。
-- **多个 profile**：`ACTIVE = ["qwen3.8-27b-ud", "qwen3.8-27b-nvfp4"]` → 依次测试，每个测完后停顿 `PAUSE_SECONDS` 秒再测下一个，各自生成独立报告。
+- **切换模型**：把 `ACTIVE` 改成 `PROFILES` 里的 key（单个字符串或列表），各脚本自动用该 profile 的 `openai_model`（llama-swap 请求 model 名）/ `proc_match`（进程定位）/ `log_file`。
+- **多个 profile**：`ACTIVE = ["qwen3.8-27b-ud", "qwen3.8-27b-nvfp4"]` → 单脚本内依次测试，每个测完后停顿 `PAUSE_SECONDS` 秒再测下一个，各自生成独立报告；`run_all_bench.py` 则是每个 profile 跑完所有启用的测试集后才切下一个。
 - **新增模型**：往 `PROFILES` 加一项，再让 `ACTIVE` 指向它。
 - 报告顶部 §0 与文件名都会标注当前 `profile=...`，区分同一 `display_name` 下的不同量化。
 
